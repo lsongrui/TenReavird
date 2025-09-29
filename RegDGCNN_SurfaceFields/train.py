@@ -246,7 +246,8 @@ def train_and_evaluate(rank, world_size, args):
                     # 2025-09-29 12:16:12,939 - INFO - Saved model from epoch 1 with Val Loss: 0.700069
                     tokens = line.strip().split()
                     try:
-                        epoch = int(tokens[6])  # after "epoch"
+                        epoch_idx = tokens.index("epoch")
+                        epoch = int(tokens[epoch_idx + 1])
                         val_loss = float(tokens[-1])
                         model_path = os.path.join(exp_dir, f"model_epoch{epoch}.pth")
                         heapq.heappush(best_models, (-val_loss, model_path))
