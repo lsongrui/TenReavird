@@ -310,17 +310,17 @@ def train_and_evaluate(rank, world_size, args):
 
     if ckpts:
         latest_ckpt = max(ckpts, key=lambda f: int(f.split('epoch')[1].split('.pth')[0]))
-        latest_epoch = int(latest_ckpt.split('epoch')[1].split('.pth')[0])
+        
+        # latest_epoch = int(latest_ckpt.split('epoch')[1].split('.pth')[0])
+        # model.load_state_dict(torch.load(os.path.join(exp_dir, latest_ckpt),
+        #                                  map_location=f'cuda:{local_rank}'))
+        # start_epoch = latest_epoch
 
-        model.load_state_dict(torch.load(os.path.join(exp_dir, latest_ckpt),
-                                         map_location=f'cuda:{local_rank}'))
-        start_epoch = latest_epoch
-
-        # checkpoint = torch.load(os.path.join(exp_dir, latest_ckpt), map_location=f'cuda:{local_rank}')
-        # model.load_state_dict(checkpoint['model_state'])
-        # optimizer.load_state_dict(checkpoint['optimizer_state'])
-        # scheduler.load_state_dict(checkpoint['scheduler_state'])
-        # start_epoch = checkpoint['epoch']
+        checkpoint = torch.load(os.path.join(exp_dir, latest_ckpt), map_location=f'cuda:{local_rank}')
+        model.load_state_dict(checkpoint['model_state'])
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
+        scheduler.load_state_dict(checkpoint['scheduler_state'])
+        start_epoch = checkpoint['epoch']
 
         if local_rank == 0:
             logging.info(f"Resumed from {latest_ckpt} at epoch {start_epoch}")
@@ -353,25 +353,25 @@ def train_and_evaluate(rank, world_size, args):
             # Save top $num_best models
             model_path = os.path.join('experiments', args.exp_name, f'model_epoch{epoch+1}.pth')
             if len(best_models) < num_best:
-                torch.save(model.state_dict(), model_path)
-                # torch.save({'epoch': epoch + 1,  # save next epoch index
-                #             'model_state': model.state_dict(),
-                #             'optimizer_state': optimizer.state_dict(),
-                #             'scheduler_state': scheduler.state_dict(),
-                #             'val_loss': val_loss,
-                #             }, model_path)
+                # torch.save(model.state_dict(), model_path)
+                torch.save({'epoch': epoch + 1,  # save next epoch index
+                            'model_state': model.state_dict(),
+                            'optimizer_state': optimizer.state_dict(),
+                            'scheduler_state': scheduler.state_dict(),
+                            'val_loss': val_loss,
+                            }, model_path)
                 heapq.heappush(best_models, (-val_loss, model_path))  # use -val_loss for max-heap
                 logging.info(f"Saved model from epoch {epoch+1} with Val Loss: {val_loss:.6f}")
             else:
                 worst_val_loss, worst_path = best_models[0]  # worst in heap
                 if val_loss < -worst_val_loss:
-                    torch.save(model.state_dict(), model_path)
-                    # torch.save({'epoch': epoch + 1,  # save next epoch index
-                    #         'model_state': model.state_dict(),
-                    #         'optimizer_state': optimizer.state_dict(),
-                    #         'scheduler_state': scheduler.state_dict(),
-                    #         'val_loss': val_loss,
-                    #         }, model_path)
+                    # torch.save(model.state_dict(), model_path)
+                    torch.save({'epoch': epoch + 1,  # save next epoch index
+                            'model_state': model.state_dict(),
+                            'optimizer_state': optimizer.state_dict(),
+                            'scheduler_state': scheduler.state_dict(),
+                            'val_loss': val_loss,
+                            }, model_path)
                     heapq.heapreplace(best_models, (-val_loss, model_path))
                     logging.info(f"Replaced {worst_path} with epoch {epoch+1} model (Val Loss: {val_loss:.6f})")
                     if os.path.exists(worst_path):
@@ -414,9 +414,11 @@ def train_and_evaluate(rank, world_size, args):
 
         for ckpt in ckpt_files:
             ckpt_path = os.path.join(exp_dir, ckpt)
-            # checkpoint = torch.load(ckpt_path, map_location=f'cuda:{local_rank}')
-            # model.load_state_dict(checkpoint['model_state'])
-            model.load_state_dict(torch.load(ckpt_path, map_location=f'cuda:{local_rank}'))
+            checkpoint = torch.load(ckpt_path, map_location=f'cuda:{local_rank}')
+            if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+                model.load_state_dict(checkpoint['model_state'])
+            else:
+                model.load_state_dict(checkpoint)
 
 
             logging.info(f"Testing {ckpt}")
@@ -466,3 +468,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
