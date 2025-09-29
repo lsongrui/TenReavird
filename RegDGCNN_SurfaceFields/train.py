@@ -235,7 +235,7 @@ def train_and_evaluate(rank, world_size, args):
                         # "1/60" → take first number
                         epoch = int(epoch_part.split("/")[0])
                         train_loss = float(line.split("Train Loss:")[1].split(",")[0].strip())
-                        val_loss = float(line.split("Val Loss:")[1].strip())
+                        val_loss = float(line.split("Val Loss:")[1].strip(")").strip())
                         train_losses.append(train_loss)
                         val_losses.append(val_loss)
                     except Exception as e:
