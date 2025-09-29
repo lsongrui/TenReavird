@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import logging
 import heapq
+import re
 
 # Import modules
 from data_loader import get_dataloaders, PRESSURE_MEAN, PRESSURE_STD
@@ -217,6 +218,43 @@ def train_and_evaluate(rank, world_size, args):
         logging.info(f"Starting training with {world_size} GPUs")
         print(f"Starting training with {world_size} GPUs")
 
+    # Helper to restore training state from log
+    def parse_log_losses(log_file, exp_dir):
+        train_losses, val_losses = [], []
+        best_models = []
+        if not os.path.exists(log_file):
+            return train_losses, val_losses, best_models
+
+        with open(log_file, 'r') as f:
+            for line in f:
+                if "Epoch" in line and "Train Loss" in line and "Val Loss" in line:
+                    # Example line:
+                    # 2025-09-29 12:16:12,921 - INFO - Epoch 1/60 - Train Loss: 0.293800, Val Loss: 0.700069
+                    try:
+                        epoch_part = line.split("Epoch")[1].split("-")[0].strip()
+                        # "1/60" → take first number
+                        epoch = int(epoch_part.split("/")[0])
+                        train_loss = float(line.split("Train Loss:")[1].split(",")[0].strip())
+                        val_loss = float(line.split("Val Loss:")[1].strip())
+                        train_losses.append(train_loss)
+                        val_losses.append(val_loss)
+                    except Exception as e:
+                        print(f"Warning: failed to parse line: {line.strip()} ({e})")
+
+                if "Saved model from epoch" in line or "Replaced" in line:
+                    # Example line:
+                    # 2025-09-29 12:16:12,939 - INFO - Saved model from epoch 1 with Val Loss: 0.700069
+                    tokens = line.strip().split()
+                    try:
+                        epoch = int(tokens[6])  # after "epoch"
+                        val_loss = float(tokens[-1])
+                        model_path = os.path.join(exp_dir, f"model_epoch{epoch}.pth")
+                        heapq.heappush(best_models, (-val_loss, model_path))
+                    except Exception as e:
+                        print(f"Warning: failed to parse model line: {line.strip()} ({e})")
+
+        return train_losses, val_losses, best_models
+
     # Initialize model
     model = initialize_model(args, local_rank)
 
@@ -262,13 +300,33 @@ def train_and_evaluate(rank, world_size, args):
     best_models = []
     train_losses = []
     val_losses = []
+    num_best = args.num_best_models
+    start_epoch = 0
 
-    if local_rank == 0:
-        logging.info(f"Starting training for {args.epochs} epochs")
-        print(f"Starting training for {args.epochs} epochs")
+    train_losses, val_losses, best_models = parse_log_losses(log_file, exp_dir)
+
+    ckpts = [f for f in os.listdir(exp_dir) if f.endswith('.pth') and f.startswith('model_epoch')]
+
+    if ckpts:
+        latest_ckpt = max(ckpts, key=lambda f: int(f.split('epoch')[1].split('.pth')[0]))
+        latest_epoch = int(latest_ckpt.split('epoch')[1].split('.pth')[0])
+
+        model.load_state_dict(torch.load(os.path.join(exp_dir, latest_ckpt),
+                                         map_location=f'cuda:{local_rank}'))
+        start_epoch = latest_epoch
+
+        # checkpoint = torch.load(os.path.join(exp_dir, latest_ckpt), map_location=f'cuda:{local_rank}')
+        # model.load_state_dict(checkpoint['model_state'])
+        # optimizer.load_state_dict(checkpoint['optimizer_state'])
+        # scheduler.load_state_dict(checkpoint['scheduler_state'])
+        # start_epoch = checkpoint['epoch']
+
+        if local_rank == 0:
+            logging.info(f"Resumed from {latest_ckpt} at epoch {start_epoch}")
+            print(f"Resumed from {latest_ckpt} at epoch {start_epoch}")
 
     # Training loop
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Set epoch for the DistributedSampler
         train_dataloader.sampler.set_epoch(epoch)
 
@@ -291,16 +349,28 @@ def train_and_evaluate(rank, world_size, args):
             #     torch.save(model.state_dict(), best_model_path)
             #     logging.info(f"New best model saved with Val Loss: {best_val_loss:.6f}")
 
-            # Save top $num_best_models models
+            # Save top $num_best models
             model_path = os.path.join('experiments', args.exp_name, f'model_epoch{epoch+1}.pth')
-            if len(best_models) < args.num_best_models:
+            if len(best_models) < num_best:
                 torch.save(model.state_dict(), model_path)
+                # torch.save({'epoch': epoch + 1,  # save next epoch index
+                #             'model_state': model.state_dict(),
+                #             'optimizer_state': optimizer.state_dict(),
+                #             'scheduler_state': scheduler.state_dict(),
+                #             'val_loss': val_loss,
+                #             }, model_path)
                 heapq.heappush(best_models, (-val_loss, model_path))  # use -val_loss for max-heap
                 logging.info(f"Saved model from epoch {epoch+1} with Val Loss: {val_loss:.6f}")
             else:
                 worst_val_loss, worst_path = best_models[0]  # worst in heap
                 if val_loss < -worst_val_loss:
                     torch.save(model.state_dict(), model_path)
+                    # torch.save({'epoch': epoch + 1,  # save next epoch index
+                    #         'model_state': model.state_dict(),
+                    #         'optimizer_state': optimizer.state_dict(),
+                    #         'scheduler_state': scheduler.state_dict(),
+                    #         'val_loss': val_loss,
+                    #         }, model_path)
                     heapq.heapreplace(best_models, (-val_loss, model_path))
                     logging.info(f"Replaced {worst_path} with epoch {epoch+1} model (Val Loss: {val_loss:.6f})")
                     if os.path.exists(worst_path):
@@ -312,8 +382,9 @@ def train_and_evaluate(rank, world_size, args):
             # Save progress plot
             if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
                 plt.figure(figsize=(10, 5))
-                plt.plot(range(1, epoch + 2), train_losses, label='Training Loss')
-                plt.plot(range(1, epoch + 2), val_losses, label='Validation Loss')
+                epochs_range = range(1, len(train_losses) + 1)
+                plt.plot(epochs_range, train_losses, label='Training Loss')
+                plt.plot(epochs_range, val_losses, label='Validation Loss')
                 plt.xlabel('Epoch')
                 plt.ylabel('Loss')
                 plt.legend()
@@ -330,18 +401,40 @@ def train_and_evaluate(rank, world_size, args):
     # Make sure all processes sync up before testing
     dist.barrier()
 
+    # === Test all saved models ===
+    if local_rank == 0:
+        logging.info("Testing all saved models")
+        print("Testing all saved models:")
+
+        ckpt_files = sorted(
+            [f for f in os.listdir(exp_dir) if f.endswith(".pth")],
+            key=lambda x: os.path.getmtime(os.path.join(exp_dir, x))  # sort by save time
+        )
+
+        for ckpt in ckpt_files:
+            ckpt_path = os.path.join(exp_dir, ckpt)
+            # checkpoint = torch.load(ckpt_path, map_location=f'cuda:{local_rank}')
+            # model.load_state_dict(checkpoint['model_state'])
+            model.load_state_dict(torch.load(ckpt_path, map_location=f'cuda:{local_rank}'))
+
+
+            logging.info(f"Testing {ckpt}")
+            print(f"Testing {ckpt}:")
+            test_model(model, test_dataloader, criterion, local_rank, exp_dir)
+
+
     # Test the final model
     if local_rank == 0:
         logging.info("Testing the final model")
         print("Testing the final model:")
     test_model(model, test_dataloader, criterion, local_rank, os.path.join('experiments', args.exp_name))
 
-    # Test the best model
-    if local_rank == 0:
-        logging.info("Testing the best model")
-        print("Testing the best model:")
-    model.load_state_dict(torch.load(best_model_path, map_location=f'cuda:{local_rank}'))
-    test_model(model, test_dataloader, criterion, local_rank, os.path.join('experiments', args.exp_name))
+    # # Test the best model
+    # if local_rank == 0:
+    #     logging.info("Testing the best model")
+    #     print("Testing the best model:")
+    # model.load_state_dict(torch.load(best_model_path, map_location=f'cuda:{local_rank}'))
+    # test_model(model, test_dataloader, criterion, local_rank, os.path.join('experiments', args.exp_name))
 
     # Clean up
     dist.destroy_process_group()
